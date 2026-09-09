@@ -1,0 +1,953 @@
+#!/bin/bash
+#
+# xdpa - XFCE Display Profile Applicator
+#
+# Takes an XFCE display profile configured by one user (typically an
+# administrator) and propagates it to every regular user account on the
+# system, so a chosen monitor layout applies consistently across accounts,
+# including accounts created after the profile was exported.
+
+set -u
+
+# System-wide configuration directory
+SYSTEM_PROFILE_DIR="/etc/xfce4-display-profiles"
+SYSTEM_PROFILE_FILE="${SYSTEM_PROFILE_DIR}/profiles.conf"
+ACTIVE_PROFILE_FILE="${SYSTEM_PROFILE_DIR}/active-profile"
+PROFILE_DATA_DIR="${SYSTEM_PROFILE_DIR}/profile-data"
+
+# Check if running as root. Callers pass their own "$@" (the subcommand and
+# its arguments, before shift) so the hint below can show the actual command
+# that needs sudo, instead of always rendering empty.
+function require_root() {
+	if [[ $EUID -ne 0 ]]; then
+		echo -e "\033[1;31mERROR: This operation requires root privileges.\033[0m"
+		if [[ $# -gt 0 ]]; then
+			echo -e "\033[1;33mPlease run with sudo: sudo xdpa $*\033[0m"
+		else
+			echo -e "\033[1;33mPlease run with sudo: sudo xdpa\033[0m"
+		fi
+		exit 1
+	fi
+}
+
+# Initialize system directories
+function init_system_dirs() {
+	mkdir -p "${SYSTEM_PROFILE_DIR}"
+	mkdir -p "${PROFILE_DATA_DIR}"
+	chmod 755 "${SYSTEM_PROFILE_DIR}"
+	chmod 755 "${PROFILE_DATA_DIR}"
+}
+
+# Read UID_MIN out of /etc/login.defs, the same file useradd/RHEL-family
+# tooling consults for "first normal user account". 1000 is only a fallback
+# for when the file or the setting is missing, not an assumption that every
+# system leaves it at the RHEL/Rocky default.
+function read_uid_min_from_login_defs() {
+	local value
+	value="$(awk '/^[[:space:]]*UID_MIN[[:space:]]+[0-9]+/ {print $2; exit}' /etc/login.defs 2>/dev/null)"
+	if [[ "$value" =~ ^[0-9]+$ ]]; then
+		printf '%s' "$value"
+	else
+		printf '%s' "1000"
+	fi
+}
+
+# Reject a username shaped so that su/id/pkill -u/getent passwd could parse
+# it as an option rather than a name, most importantly a leading '-'. Local
+# useradd already refuses this, but every username this script acts on can
+# also arrive via NSS (LDAP/SSSD), whose own validation is outside this
+# host's, and this script's, control, so it is re-checked here rather than
+# trusted at the point it's about to reach a root-run su/pkill/id/getent
+# call. Anchored so the whole string must match: first character a letter
+# or underscore (never '-' or a digit), remaining characters letters,
+# digits, underscore, dot, or hyphen.
+function is_safe_username() {
+	local name="$1"
+	[[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]
+}
+
+# Whether a passwd entry describes a "regular user" this tool should manage:
+# a safely-shaped username (see is_safe_username above), UID inside the
+# normal range, a real home directory, and a real login shell (not a
+# nologin/false service-account shell). Matching by suffix (rather than the
+# exact string "/sbin/nologin") also catches "/usr/sbin/nologin", which is
+# where that binary actually lives on Rocky/RHEL 8 (/sbin/nologin is a
+# symlink to it, and either spelling can end up stored in the passwd shell
+# field).
+function is_regular_user() {
+	local username="$1" uid="$2" home="$3" shell="$4"
+	is_safe_username "$username" || return 1
+	(( uid >= REGULAR_UID_MIN )) || return 1
+	(( uid <= REGULAR_UID_MAX )) || return 1
+	[[ -d "$home" ]] || return 1
+	[[ "$shell" == */nologin ]] && return 1
+	[[ "$shell" == */false ]] && return 1
+	return 0
+}
+
+# Whether a user currently has a session `who` can see. Factored out so
+# verify_status() and refresh_user() (previously each carrying their own
+# copy of this exact line) can't drift out of sync on how "logged in" is
+# determined. Fixed-string match (not a `grep -q "^$username "` BRE
+# pattern) so a username containing a literal '.' (allowed by
+# is_safe_username above) can't be misread as "any character" by a regex
+# engine, however low the practical impact of that would be here.
+function is_user_logged_in() {
+	local username="$1"
+	who | grep -Fq -- "${username} "
+}
+
+# Look up the display name recorded for a profile ID in the flat
+# profiles.conf store (id:name:user, one record per line), by exact match
+# on the first colon-delimited field. This replaces three call sites that
+# used to do `grep "^${id}:" "$file" | cut -d: -f2`: profile_id/active_id
+# is free-form text (the id argument to --export, typed by an admin) and
+# was being interpolated unescaped into a grep basic regular expression, so
+# an id containing a BRE metacharacter (. * [ ^ $) changed what the pattern
+# matched instead of doing a literal lookup. Switching to `grep -F` alone
+# would not be enough to fix this correctly: -F disables regex handling
+# for the whole pattern, including the leading `^` anchor, so a fixed-
+# string search for "id:" can still cross-match a different record whose
+# id happens to end in this one as a suffix. awk's exact `$1 == id` test
+# has neither problem.
+function lookup_profile_name() {
+	local id="$1" file="$2"
+	awk -F: -v id="$id" '$1 == id { print $2; exit }' "$file"
+}
+
+# Whether/how to reach a given uid's own D-Bus session bus from an `su -c`
+# command string. A plain `su - <user>` does not reliably inherit a
+# working DBUS_SESSION_BUS_ADDRESS, so every su -c call site in this file
+# that runs xfconf-query as another user needs this accommodation. Before
+# this helper existed it was three independent, textually-identical
+# copies of the same check (run_xfconf_query_as, build_profile_apply_
+# script, build_profile_refresh_script), plus a fourth call site
+# (export_profile's own live property dump) that had been missed
+# entirely -- the actual, deterministic cause of a "first export after a
+# fresh save comes back empty" failure that testing had originally
+# reproduced but mis-diagnosed as a timing race; a follow-up live-VM run
+# proved the su -c call fails the same way every time, not
+# intermittently, until this same accommodation is applied to it too.
+# Returns the "export DBUS_SESSION_BUS_ADDRESS=...; " fragment (trailing
+# "; " so a caller building a single inline command string can prepend it
+# directly) or an empty string when /run/user/<uid> doesn't exist; a
+# caller building a cmds array instead strips the trailing "; " before
+# appending it as its own line.
+function dbus_session_prefix_for_uid() {
+	local uid="$1"
+	if [[ -n "$uid" ]] && [[ -d "/run/user/${uid}" ]]; then
+		printf 'export DBUS_SESSION_BUS_ADDRESS=%s; ' "$(printf '%q' "unix:path=/run/user/${uid}/bus")"
+	fi
+}
+
+# The system profile store (id:name:user, one record per line) has no
+# escaping for its delimiter, and every reader (apply_system_profile,
+# verify_status, refresh_user, list_system_profiles) assumes exactly three
+# colon-delimited fields. Reject a field that would corrupt that shape
+# before it's ever written, rather than letting every reader silently
+# mis-parse a name (or an id) containing an embedded colon, or letting an
+# embedded newline split one record into a bogus extra "profile."
+function reject_if_breaks_flat_store() {
+	local label="$1" value="$2"
+	if [[ "$value" == *:* ]] || [[ "$value" == *$'\n'* ]]; then
+		echo -e "\033[1;31mERROR: $label cannot contain a colon or a newline: $value\033[0m"
+		exit 1
+	fi
+}
+
+# Run xfconf-query, either directly (as the invoking user) or, when
+# as_user is non-empty, as that other user via a login shell. Every
+# argument after as_user is shell-quoted with printf %q before being
+# handed to `su -c`, so a profile ID or property value containing shell
+# metacharacters can't break out of the intended argument. as_user itself
+# is validated with is_safe_username before it ever reaches `su`/`id`, and
+# DBUS_SESSION_BUS_ADDRESS is exported via dbus_session_prefix_for_uid
+# (same accommodation the write-path script builders below use): this is
+# the one helper every read-only lookup in this file (list_profile_ids,
+# list_user_profiles, verify_status's live-registration check) goes
+# through, so fixing it once here fixes it for all three call sites
+# instead of only the write path.
+function run_xfconf_query_as() {
+	local as_user="$1"
+	shift
+	if [[ -n "$as_user" ]]; then
+		is_safe_username "$as_user" || return 1
+
+		local quoted_args
+		quoted_args="$(printf '%q ' "$@")"
+
+		local as_uid dbus_prefix
+		as_uid="$(id -u "$as_user" 2>/dev/null || true)"
+		dbus_prefix="$(dbus_session_prefix_for_uid "$as_uid")"
+
+		su - "$as_user" -c "${dbus_prefix}xfconf-query ${quoted_args}" 2>/dev/null
+	else
+		xfconf-query "$@" 2>/dev/null
+	fi
+}
+
+# Enumerate the profile IDs known to the "displays" xfconf channel: list
+# property *names* only (xfconf-query -l, no -v -- values aren't needed to
+# find IDs), take the first path segment after the leading slash as the
+# candidate ID, keep only the first occurrence of each ID with an
+# associative array (in place of `uniq`, which only dedups consecutive
+# lines), and shape-match with a bash regex (in place of piping to
+# `grep -E`).
+function list_profile_ids() {
+	local as_user="$1"
+	local prop_names
+	prop_names="$(run_xfconf_query_as "$as_user" -c displays -l)"
+
+	local -A seen=()
+	local prop profile_id
+	while IFS= read -r prop; do
+		[[ -z "$prop" ]] && continue
+		profile_id="${prop#/}"
+		profile_id="${profile_id%%/*}"
+		if [[ "$profile_id" =~ ^(Default|Fallback|[[:alnum:]]{40})$ ]] && [[ -z "${seen[$profile_id]:-}" ]]; then
+			seen[$profile_id]=1
+			printf '%s\n' "$profile_id"
+		fi
+	done <<< "$prop_names"
+}
+
+# Shell fragment that creates a user's xfconf directory chain and stages
+# their displays.xml from this tool's own master copy. Deliberately never
+# run as root: every caller below passes this to `su - <user> -c`, so
+# $HOME (resolved by the shell that actually executes this, not by us) and
+# every path built from it are only ever touched with that user's own
+# permissions.
+#
+# This replaces an earlier design (mkdir -p/cp done directly by root,
+# followed by a narrow, non-recursive `chown` of the same path list) that
+# was a critical privilege-escalation hole: a local user could replace
+# ~/.config/xfce4 with a symlink to any root-owned path before an admin's
+# next --apply/--refresh-user run (e.g. `ln -s /etc ~/.config/xfce4`), and
+# root's own `mkdir -p`/`cp` would transparently traverse it, followed by
+# `chown "$username" /etc` (GNU chown without -h dereferences a symlink
+# target). Adding `-h`/`--no-dereference` to that chown would only have
+# stopped the *chown* from following the symlink; it would have done
+# nothing about the `mkdir -p`/`cp` calls immediately before it also being
+# redirected through the same symlinked path, which is the actual
+# arbitrary-directory-creation and arbitrary-write primitive. Running the
+# whole staging step as the target user instead removes the privilege
+# boundary the attack depends on: if that user has symlinked their own
+# ~/.config/xfce4 to /etc, `mkdir -p`/`cp` here now run with *their* normal
+# permissions on /etc (0755, owned by root), which is exactly what fails
+# with "Permission denied" if that same user tried it directly by hand. No
+# root-run chown of anything under a user-controlled directory happens
+# anywhere in this script any more.
+#
+# `set -e` here is deliberate and load-bearing: mkdir/cp failing (for
+# example because of exactly the symlink scenario above) must abort the
+# rest of whatever script this fragment is embedded in, rather than
+# silently continuing to register a profile against a directory that was
+# never actually staged. The xfconf-query lines appended after this
+# fragment by build_profile_apply_script/build_profile_refresh_script each
+# carry their own `|| true`, which still tolerates an individual property
+# write failing even under `set -e`, exactly as before this change.
+function build_user_stage_script() {
+	cat <<EOF
+set -e
+xfconf_dir="\$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+mkdir -p "\$xfconf_dir"
+if [[ ! -f "\$xfconf_dir/displays.xml" ]]; then
+	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<channel name="displays" version="1.0">' '</channel>' > "\$xfconf_dir/displays.xml"
+fi
+cp "\$xfconf_dir/displays.xml" "\$xfconf_dir/displays.xml.bak" 2>/dev/null || true
+cp "${PROFILE_DATA_DIR}/master-displays.xml" "\$xfconf_dir/displays.xml"
+EOF
+}
+
+# Build the full sequence of xfconf-query calls needed to register and
+# activate one profile for one user, as a single in-memory string (never
+# written to disk). Passed as a single argument to `su -c`, this replaces
+# the earlier design of writing a root-owned script to a predictable path
+# under /tmp, chmod'ing it executable, and running it from there, which is
+# a classic local-privilege-escalation pattern (a fixed, guessable path,
+# world-writable-directory-adjacent, racy between write and execute).
+# Every interpolated value is escaped with printf %q before being placed
+# in the command string.
+function build_profile_apply_script() {
+	local profile_id="$1" profile_name="$2" user_uid="$3"
+	local -a cmds=()
+
+	# Stage the directory/file first, as the target user (see
+	# build_user_stage_script's own comment for why); its `set -e`
+	# propagates through the rest of this combined script, so a staging
+	# failure aborts before any registration is attempted.
+	cmds+=("$(build_user_stage_script)")
+
+	local dbus_prefix
+	dbus_prefix="$(dbus_session_prefix_for_uid "$user_uid")"
+	[[ -n "$dbus_prefix" ]] && cmds+=("${dbus_prefix%; }")
+
+	cmds+=("xfconf-query --create -c displays -p $(printf '%q' "/${profile_id}") -t string -s $(printf '%q' "$profile_name") 2>/dev/null || true")
+	cmds+=("xfconf-query --create -c displays -p /ActiveProfile -t string -s $(printf '%q' "$profile_id") 2>/dev/null || true")
+	cmds+=('xfconf-query --create -c displays -p /AutoEnableProfiles -t bool -s true 2>/dev/null || true')
+	cmds+=('xfconf-query --create -c displays -p /Notify -t bool -s true 2>/dev/null || true')
+
+	if [[ -f "${PROFILE_DATA_DIR}/profile-properties.txt" ]]; then
+		local prop value type
+		while IFS=' ' read -r prop value; do
+			[[ "$prop" == "/${profile_id}"* ]] || continue
+
+			if [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
+				type="bool"
+			elif [[ "$value" =~ ^-?[0-9]+$ ]]; then
+				type="int"
+			elif [[ "$value" =~ ^-?[0-9]+\.[0-9]+$ ]]; then
+				type="double"
+			else
+				type="string"
+			fi
+
+			cmds+=("xfconf-query --create -c displays -p $(printf '%q' "$prop") -t $type -s $(printf '%q' "$value") 2>/dev/null || true")
+		done < "${PROFILE_DATA_DIR}/profile-properties.txt"
+	fi
+
+	printf '%s\n' "${cmds[@]}"
+}
+
+# Narrower counterpart of build_profile_apply_script used by
+# --refresh-user: re-registers the profile name and marks it active, but
+# does not re-import AutoEnableProfiles/Notify or any exported per-profile
+# properties. That is the existing, documented behavior of --refresh-user
+# (it re-applies what --apply already set up), not an omission introduced
+# by this rewrite. Does not include build_user_stage_script's fragment:
+# refresh_user() stages the directory/file in its own earlier, separate
+# `su -c` call, since staging must happen even when the user isn't logged
+# in (see refresh_user), while this registration script only runs when
+# they are.
+#
+# user_uid is optional so this stays callable with the same two-argument
+# shape as before for anything that doesn't need the D-Bus export; when
+# given, it enables the same DBUS_SESSION_BUS_ADDRESS export
+# build_profile_apply_script already does. refresh_user() previously
+# computed a user_uid of its own and never passed it anywhere, so the
+# write path's D-Bus accommodation only ever applied to --apply, never to
+# --refresh-user, for no documented reason; passing it through here closes
+# that gap rather than leaving it as a second, unexplained inconsistency
+# alongside the one review already flagged for the read path.
+function build_profile_refresh_script() {
+	local profile_id="$1" profile_name="$2" user_uid="${3:-}"
+	local -a cmds=()
+
+	local dbus_prefix
+	dbus_prefix="$(dbus_session_prefix_for_uid "$user_uid")"
+	[[ -n "$dbus_prefix" ]] && cmds+=("${dbus_prefix%; }")
+
+	cmds+=("xfconf-query --create -c displays -p $(printf '%q' "/${profile_id}") -t string -s $(printf '%q' "$profile_name")")
+	cmds+=("xfconf-query --create -c displays -p /ActiveProfile -t string -s $(printf '%q' "$profile_id")")
+
+	printf '%s\n' "${cmds[@]}"
+}
+
+# List user's XFCE display profiles
+function list_user_profiles() {
+	echo -e "\033[1;34mYour XFCE Display Profiles:\033[0m"
+	echo "================================="
+
+	local as_user=""
+	if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
+		# Loud on failure, matching export_profile()'s source_user guard
+		# and refresh_user()'s username guard: this used to be one clause
+		# of a larger && condition, so a SUDO_USER that failed
+		# is_safe_username fell through silently into showing root's own
+		# (usually empty) profile list, with nothing printed to explain
+		# why the invoking user's profiles weren't the ones shown.
+		if ! is_safe_username "$SUDO_USER"; then
+			echo -e "\033[1;31mERROR: Invalid invoking user: $SUDO_USER\033[0m"
+			exit 1
+		fi
+		echo -e "\033[1;33mShowing profiles for user: $SUDO_USER\033[0m"
+		as_user="$SUDO_USER"
+	fi
+
+	local -a profile_ids=()
+	mapfile -t profile_ids < <(list_profile_ids "$as_user")
+
+	if [[ ${#profile_ids[@]} -eq 0 ]]; then
+		echo -e "\033[1;33mNo profiles found or XFCE not running\033[0m"
+		return
+	fi
+
+	local active_id
+	active_id="$(run_xfconf_query_as "$as_user" -c displays -p /ActiveProfile)"
+
+	# One verbose dump (property name *and* value, in a single call),
+	# parsed locally for every profile's display name, rather than a
+	# separate single-property query per profile ID. This is the same
+	# dump-then-parse shape list_profile_ids() and export_profile() already
+	# use against this channel, deliberately not a per-ID
+	# "xfconf-query -p /<id>" lookup (that one-line-per-name shape is what
+	# upstream's own name-lookup function used, differing only in variable
+	# naming and a stderr redirect picked up incidentally through
+	# run_xfconf_query_as).
+	local dump
+	dump="$(run_xfconf_query_as "$as_user" -c displays -v -l)"
+	local -A names=()
+	local prop value
+	while IFS=' ' read -r prop value; do
+		[[ -z "$prop" ]] && continue
+		names["${prop#/}"]="$value"
+	done <<< "$dump"
+
+	local profile_id name
+	for profile_id in "${profile_ids[@]}"; do
+		name="${names[$profile_id]:-}"
+		[[ -z "$name" ]] && name="$profile_id"
+
+		if [[ "$profile_id" == "$active_id" ]]; then
+			echo -e "\033[1;32m* $profile_id - $name (ACTIVE)\033[0m"
+		else
+			echo "  $profile_id - $name"
+		fi
+	done
+}
+
+# Export profile from user to system storage
+function export_profile() {
+	local profile_id="${1:-}"
+	local profile_name="${2:-$profile_id}"
+
+	if [[ -z "$profile_id" ]]; then
+		echo -e "\033[1;31mERROR: Profile ID required\033[0m"
+		echo "Usage: xdpa --export <id> [name]"
+		exit 1
+	fi
+
+	reject_if_breaks_flat_store "Profile ID" "$profile_id"
+	reject_if_breaks_flat_store "Profile name" "$profile_name"
+
+	init_system_dirs
+
+	local source_user="${SUDO_USER:-${USER:-}}"
+	if [[ "$source_user" == "root" ]]; then
+		echo -e "\033[1;31mERROR: Cannot export from root. Run as: sudo xdpa --export <id>\033[0m"
+		exit 1
+	fi
+
+	if [[ -z "$source_user" ]]; then
+		echo -e "\033[1;31mERROR: Could not determine which user to export from.\033[0m"
+		exit 1
+	fi
+
+	if ! is_safe_username "$source_user"; then
+		echo -e "\033[1;31mERROR: Invalid source user: $source_user\033[0m"
+		exit 1
+	fi
+
+	echo -e "\033[1;34mExporting profile from user: $source_user\033[0m"
+
+	local user_home
+	user_home="$(getent passwd "$source_user" | cut -d: -f6)"
+	local xfconf_file="${user_home}/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+
+	if [[ ! -f "$xfconf_file" ]]; then
+		echo -e "\033[1;31mERROR: Cannot find XFCE configuration for user $source_user\033[0m"
+		exit 1
+	fi
+
+	cp "$xfconf_file" "${PROFILE_DATA_DIR}/master-displays.xml"
+
+	echo -e "\033[1;34mExtracting profile properties...\033[0m"
+
+	# This su -c call is the one call site in the file that testing found
+	# had been missed when DBUS_SESSION_BUS_ADDRESS handling was added
+	# everywhere else (run_xfconf_query_as, build_profile_apply_script,
+	# build_profile_refresh_script). The first testing pass saw an
+	# intermittent-looking "first --export after a fresh save comes back
+	# with zero properties" pattern and treated it as a race between the
+	# GUI's own xfconf writes settling and this dump. A follow-up live-VM
+	# run disproved the race theory directly: run by hand,
+	# `su - <user> -c 'xfconf-query -v -l -c displays'` failed
+	# deterministically every time with "Failed to init libxfconf: Cannot
+	# autolaunch D-Bus without X11 $DISPLAY" whenever
+	# DBUS_SESSION_BUS_ADDRESS wasn't set, including across 3 attempts
+	# spanning 15 seconds, which a genuine settling-time race would be
+	# expected to clear at least once. dbus_session_prefix_for_uid below
+	# is the actual fix. The retry loop is kept anyway as a secondary
+	# safety net for a real, still-possible race (xfconfd itself not yet
+	# up), not as a substitute for the D-Bus fix; the on-disk displays.xml
+	# copy above is unaffected either way, only this per-property dump is
+	# read through su -c at all.
+	local source_uid dbus_prefix
+	source_uid="$(id -u "$source_user" 2>/dev/null || true)"
+	dbus_prefix="$(dbus_session_prefix_for_uid "$source_uid")"
+
+	local attempt line_count=0
+	for attempt in 1 2 3; do
+		su - "$source_user" -c "${dbus_prefix}xfconf-query -v -l -c displays" 2>/dev/null | \
+			grep "^/[A-Za-z0-9]" > "${PROFILE_DATA_DIR}/profile-properties.txt"
+		line_count="$(wc -l < "${PROFILE_DATA_DIR}/profile-properties.txt")"
+		[[ "$line_count" -gt 0 ]] && break
+		[[ "$attempt" -lt 3 ]] && sleep 0.5
+	done
+
+	if [[ "$line_count" -eq 0 ]]; then
+		echo -e "\033[1;33mWARNING: no per-property display data captured for $source_user after 3 attempts. Only the profile name and the flat ActiveProfile/AutoEnableProfiles/Notify properties will be registered on --apply; the on-disk displays.xml copy still has the full data, so re-running --export once xfconf settles will pick up the rest.\033[0m"
+	fi
+
+	echo "${profile_id}:${profile_name}:${source_user}" > "${SYSTEM_PROFILE_FILE}"
+	echo "$profile_id" > "${ACTIVE_PROFILE_FILE}"
+
+	echo -e "\033[1;32mProfile exported successfully: $profile_id - $profile_name\033[0m"
+}
+
+# Apply system profile to ALL users
+function apply_system_profile() {
+	local profile_id="${1:-}"
+	local explicit_id=0
+	if [[ -n "$profile_id" ]]; then
+		explicit_id=1
+	else
+		profile_id="$(cat "${ACTIVE_PROFILE_FILE}" 2>/dev/null)"
+	fi
+
+	if [[ -z "$profile_id" ]]; then
+		echo -e "\033[1;31mERROR: No profile ID specified and no active profile set\033[0m"
+		exit 1
+	fi
+
+	if [[ ! -f "${PROFILE_DATA_DIR}/master-displays.xml" ]]; then
+		echo -e "\033[1;31mERROR: No master display configuration found. Export a profile first.\033[0m"
+		exit 1
+	fi
+
+	local profile_name=""
+	if [[ -f "$SYSTEM_PROFILE_FILE" ]]; then
+		profile_name="$(lookup_profile_name "$profile_id" "$SYSTEM_PROFILE_FILE")"
+
+		# When profile_id was given explicitly (as opposed to falling back
+		# to ACTIVE_PROFILE_FILE above), make sure it's actually the
+		# profile that was exported. Without this, `sudo xdpa --apply
+		# some-other-id` would silently register "some-other-id" as the
+		# active profile using the display data captured under a
+		# completely different, real export, mislabeling the applied
+		# configuration under an ID nobody exported.
+		if [[ "$explicit_id" -eq 1 ]]; then
+			local exported_id
+			exported_id="$(awk -F: 'NR==1 { print $1; exit }' "$SYSTEM_PROFILE_FILE")"
+			if [[ -n "$exported_id" ]] && [[ "$profile_id" != "$exported_id" ]]; then
+				echo -e "\033[1;31mERROR: $profile_id does not match the exported profile ($exported_id). Export it first with: sudo xdpa --export $profile_id <name>\033[0m"
+				exit 1
+			fi
+		fi
+	fi
+	[[ -z "$profile_name" ]] && profile_name="SystemProfile"
+
+	echo -e "\033[1;34mApplying profile $profile_id ($profile_name) to all users...\033[0m"
+
+	local count=0
+	local username uid home shell
+	while IFS=: read -r username _ uid _ _ home shell; do
+		is_regular_user "$username" "$uid" "$home" "$shell" || continue
+
+		echo -e "\033[1;34m  Configuring user: $username\033[0m"
+
+		local user_uid
+		user_uid="$(id -u "$username")"
+
+		# Staging (mkdir/cp of displays.xml under the user's own
+		# ~/.config) and profile registration now run as ONE combined
+		# script, entirely as the target user (see
+		# build_user_stage_script's comment for why), never as root. The
+		# combined script's real exit status drives $count: previously
+		# `su -c "$apply_script" 2>/dev/null || true` swallowed both
+		# stderr and the exit status, so a user whose apply genuinely
+		# failed was still counted as a success with no indication
+		# anywhere in the tool's own output.
+		local apply_script
+		apply_script="$(build_profile_apply_script "$profile_id" "$profile_name" "$user_uid")"
+
+		if su - "$username" -c "$apply_script"; then
+			((count++)) || true
+		else
+			echo -e "\033[1;31m  ✗ Failed to apply profile to $username (check for an unexpected symlink under ~/.config, or a permissions problem in that account's home directory)\033[0m"
+		fi
+	done < <(getent passwd)
+
+	create_autostart_entry
+
+	if [[ -d "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml" ]]; then
+		echo -e "\033[1;34m  Setting system-wide XFCE default...\033[0m"
+		cp "${PROFILE_DATA_DIR}/master-displays.xml" \
+		   "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+	fi
+
+	echo -e "\033[1;32mProfile applied to $count users successfully!\033[0m"
+	echo -e "\033[1;33mUsers will see the profile in Display settings after logging out and back in.\033[0m"
+	echo -e "\033[1;33mThe profile will appear in: Display → Advanced → Profiles\033[0m"
+}
+
+# Create the XDG autostart entry that reapplies the active system profile
+# at every future login. Takes no arguments: PROFILE_ID and PROFILE_NAME
+# are both resolved at *run* time, inside the generated
+# /usr/local/bin/xdpa-apply, from active-profile/profiles.conf, the same
+# files apply_system_profile()/refresh_user() already read. That is a
+# deliberate rewrite, not just a cosmetic one: this function used to take
+# profile_name and interpolate it directly into the second heredoc's
+# source (PROFILE_NAME="${profile_name}") via an *unquoted* `<< EOF`. That
+# heredoc becomes /usr/local/bin/xdpa-apply, a root-owned, chmod 755 script
+# re-run at every future login by whoever logs in (via the .desktop entry
+# below), so a profile name containing shell metacharacters (chosen at
+# --export time by whoever is root at that moment) became live shell
+# syntax the next time xdpa-apply ran, in the login session of every
+# subsequent user, including a more privileged admin who later logs into
+# the same desktop. Both heredocs below are now fully quoted (`<< 'EOF'`),
+# so nothing this function writes is ever built from interpolated,
+# admin-supplied text; escaping profile_name instead of removing it (e.g.
+# with printf %q, the way build_profile_apply_script escapes the same
+# value) would also have closed this, but not embedding untrusted data in
+# generated shell source at all is the more robust fix, per this repo's
+# security review.
+function create_autostart_entry() {
+	# Create XDG autostart directory
+	mkdir -p /etc/xdg/autostart
+
+	# Create autostart desktop file
+	cat > /etc/xdg/autostart/xdpa-apply.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=XDPA - System Display Profile Applicator
+Comment=Apply system-wide XFCE display profile
+Exec=/usr/local/bin/xdpa-apply
+Terminal=false
+StartupNotify=false
+Hidden=false
+EOF
+
+	# Create the apply script itself. PROFILE_ID/PROFILE_NAME are looked
+	# up by exact match on profiles.conf's first colon-delimited field
+	# (awk, not a `grep "^$PROFILE_ID:"` BRE pattern), for the same reason
+	# lookup_profile_name() above replaced the equivalent grep calls: a
+	# stored profile ID containing a regex metacharacter would otherwise
+	# change what this matches.
+	cat > /usr/local/bin/xdpa-apply << 'EOF'
+#!/bin/bash
+# Apply system display profile if it exists
+
+PROFILE_FILE="/etc/xfce4-display-profiles/active-profile"
+PROFILE_INFO="/etc/xfce4-display-profiles/profiles.conf"
+
+if [[ -f "$PROFILE_FILE" ]]; then
+	PROFILE_ID=$(cat "$PROFILE_FILE")
+	PROFILE_NAME="SystemProfile"
+
+	# Get profile name from info file if available
+	if [[ -f "$PROFILE_INFO" ]]; then
+		FOUND_NAME=$(awk -F: -v id="$PROFILE_ID" '$1 == id { print $2; exit }' "$PROFILE_INFO")
+		[[ -n "$FOUND_NAME" ]] && PROFILE_NAME="$FOUND_NAME"
+	fi
+
+	if [[ -n "$PROFILE_ID" ]]; then
+		# Wait for desktop to initialize
+		sleep 3
+
+		# Register the profile in xfconf
+		xfconf-query --create -c displays -p "/$PROFILE_ID" -t string -s "$PROFILE_NAME" 2>/dev/null || true
+
+		# Apply the profile
+		xfconf-query --create -c displays -p '/ActiveProfile' -t string -s "$PROFILE_ID" 2>/dev/null || true
+		xfconf-query --create -c displays -p '/Schemes/Apply' -t string -s "$PROFILE_ID" 2>/dev/null || true
+
+		# Enable auto-configuration
+		xfconf-query --create -c displays -p '/AutoEnableProfiles' -t bool -s true 2>/dev/null || true
+		xfconf-query --create -c displays -p '/Notify' -t bool -s true 2>/dev/null || true
+	fi
+fi
+EOF
+
+	chmod 755 /usr/local/bin/xdpa-apply
+}
+
+# List system profiles
+function list_system_profiles() {
+	echo -e "\033[1;34mSystem-wide Display Profiles:\033[0m"
+	echo "================================="
+
+	if [[ ! -f "$SYSTEM_PROFILE_FILE" ]]; then
+		echo -e "\033[1;33mNo system profiles configured\033[0m"
+		return
+	fi
+
+	local id name user active
+	while IFS=: read -r id name user; do
+		active=""
+		if [[ -f "$ACTIVE_PROFILE_FILE" ]] && [[ "$(cat "$ACTIVE_PROFILE_FILE")" == "$id" ]]; then
+			active=" (ACTIVE)"
+		fi
+		echo "  $id - $name (exported by $user)$active"
+	done < "$SYSTEM_PROFILE_FILE"
+}
+
+# Verify profile status
+function verify_status() {
+	echo -e "\033[1;34mSystem Profile Status:\033[0m"
+	echo "================================="
+
+	local active_id=""
+	local profile_name=""
+	if [[ -f "$ACTIVE_PROFILE_FILE" ]]; then
+		active_id="$(cat "$ACTIVE_PROFILE_FILE")"
+		echo -e "\033[1;32mActive Profile: $active_id\033[0m"
+
+		if [[ -f "$SYSTEM_PROFILE_FILE" ]]; then
+			profile_name="$(lookup_profile_name "$active_id" "$SYSTEM_PROFILE_FILE")"
+			[[ -n "$profile_name" ]] && echo -e "\033[1;32mProfile Name: $profile_name\033[0m"
+		fi
+	else
+		echo -e "\033[1;33mNo active profile set\033[0m"
+		return
+	fi
+
+	if [[ -f "${PROFILE_DATA_DIR}/master-displays.xml" ]]; then
+		echo -e "\033[1;32m✓ Master configuration exists\033[0m"
+	else
+		echo -e "\033[1;31m✗ Master configuration missing\033[0m"
+	fi
+
+	if [[ -f "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/displays.xml" ]]; then
+		echo -e "\033[1;32m✓ System-wide default set\033[0m"
+	else
+		echo -e "\033[1;33m○ System-wide default not set\033[0m"
+	fi
+
+	echo
+	echo -e "\033[1;34mUser Status:\033[0m"
+
+	# `cmp` (diffutils) is used below only for the not-logged-in branch;
+	# check once whether it's even installed rather than letting a
+	# missing binary silently read as "command not found" -> false ->
+	# every user reported as "Config differs" regardless of the real
+	# state, worse than a plain, explicit "can't check" message.
+	local have_cmp=1
+	command -v cmp >/dev/null 2>&1 || have_cmp=0
+
+	local username uid home shell
+	while IFS=: read -r username _ uid _ _ home shell; do
+		is_regular_user "$username" "$uid" "$home" "$shell" || continue
+
+		echo -n "  $username: "
+
+		local status_messages=""
+		local user_displays_xml="${home}/.config/xfce4/xfconf/xfce-perchannel-xml/displays.xml"
+
+		if [[ -f "$user_displays_xml" ]]; then
+			if is_user_logged_in "$username"; then
+				# A live xfsettingsd/xfconfd for a logged-in user
+				# re-serializes displays.xml (dropping/restructuring
+				# blocks) as soon as any property is written via
+				# xfconf-query --create, so a raw byte comparison
+				# against the master copy goes stale the moment the
+				# daemon touches the file, independent of whether
+				# propagation actually worked. Testing reproduced both
+				# directions of this on two otherwise-identical runs
+				# (one machine showed "Config differs" after a fully
+				# successful apply, the other showed a byte-identical
+				# match for the same reason in reverse), so the file
+				# comparison is dropped entirely for a logged-in user;
+				# the live xfconf-query registration check below is
+				# already the meaningful signal for that case.
+				local profile_check
+				profile_check="$(run_xfconf_query_as "$username" -c displays -p "/${active_id}")"
+				if [[ -n "$profile_check" ]]; then
+					status_messages="\033[1;32m✓ Profile registered\033[0m"
+				else
+					status_messages="\033[1;31m✗ Profile not in xfconf\033[0m"
+				fi
+			elif [[ "$have_cmp" -eq 0 ]]; then
+				status_messages="\033[1;33m? Cannot compare configs (cmp not found; install diffutils)\033[0m \033[2;37m(not logged in)\033[0m"
+			elif [[ -L "$user_displays_xml" ]]; then
+				# Root only reads this file here (a same/differs boolean,
+				# never trusted for a write or a privilege decision), so
+				# this is not the write-side symlink attack the critical
+				# finding was about. But it is still root dereferencing a
+				# path under a directory the target user fully controls,
+				# and the write-side fix elsewhere in this file (delegate
+				# to the user via su -c rather than have root touch the
+				# path at all) wasn't mirrored here. Refuse to read
+				# through a symlinked leaf rather than follow it.
+				status_messages="\033[1;33m? Cannot compare configs ($user_displays_xml is a symlink)\033[0m \033[2;37m(not logged in)\033[0m"
+			elif cmp -s "${PROFILE_DATA_DIR}/master-displays.xml" "$user_displays_xml"; then
+				# Nobody is logged in to have touched the file since
+				# --apply/--refresh-user wrote it, so a byte comparison
+				# against the master copy is a reliable signal here,
+				# unlike the logged-in case above.
+				status_messages="\033[1;32m✓ Profile configured\033[0m \033[2;37m(not logged in)\033[0m"
+			else
+				status_messages="\033[1;33m⚠ Config differs\033[0m \033[2;37m(not logged in)\033[0m"
+			fi
+		else
+			status_messages="\033[1;31m✗ No configuration\033[0m"
+		fi
+
+		echo -e "$status_messages"
+	done < <(getent passwd)
+
+	echo
+	echo -e "\033[1;33mNote: Users must log out and back in to see profiles in Display settings.\033[0m"
+	echo -e "\033[1;33mIf a user doesn't see the profile after login, run:\033[0m"
+	echo -e "\033[1;33m  sudo xdpa --refresh-user <username>\033[0m"
+}
+
+# Force refresh profile for a specific user
+function refresh_user() {
+	local username="${1:-}"
+
+	if [[ -z "$username" ]]; then
+		echo -e "\033[1;31mERROR: Username required\033[0m"
+		echo "Usage: xdpa --refresh-user <username>"
+		exit 1
+	fi
+
+	if ! is_safe_username "$username"; then
+		echo -e "\033[1;31mERROR: Invalid username: $username\033[0m"
+		exit 1
+	fi
+
+	if ! id "$username" &>/dev/null; then
+		echo -e "\033[1;31mERROR: User $username does not exist\033[0m"
+		exit 1
+	fi
+
+	local profile_id
+	profile_id="$(cat "${ACTIVE_PROFILE_FILE}" 2>/dev/null)"
+	if [[ -z "$profile_id" ]]; then
+		echo -e "\033[1;31mERROR: No active profile set\033[0m"
+		exit 1
+	fi
+
+	local profile_name=""
+	if [[ -f "$SYSTEM_PROFILE_FILE" ]]; then
+		profile_name="$(lookup_profile_name "$profile_id" "$SYSTEM_PROFILE_FILE")"
+	fi
+	[[ -z "$profile_name" ]] && profile_name="SystemProfile"
+
+	echo -e "\033[1;34mRefreshing profile for user: $username\033[0m"
+	echo -e "\033[1;34mProfile: $profile_id ($profile_name)\033[0m"
+
+	local user_uid
+	user_uid="$(id -u "$username")"
+
+	# Stage the directory/file as the target user, never as root (see
+	# build_user_stage_script's comment for the full rationale). This
+	# used to be root's own `mkdir -p`/`cp`, immediately followed by a
+	# narrow, non-recursive `chown` of the same paths, which is exactly
+	# the shape the critical symlink finding was raised against: a user
+	# who replaced their own ~/.config/xfce4 with a symlink to any
+	# root-owned path got that path `mkdir -p`'d/`cp`'d into and then
+	# chowned to themselves the next time an admin ran --refresh-user.
+	echo -e "\033[1;34m  Staging master configuration...\033[0m"
+	if ! su - "$username" -c "$(build_user_stage_script)"; then
+		# Named causes are illustrative, not diagnostic: refresh_user()
+		# doesn't gate on is_regular_user() (an admin naming a specific
+		# account by hand is a different, deliberate use case from the
+		# bulk --apply loop, which does gate on it), so `su -c` failing
+		# here can equally mean $username has no interactive login shell
+		# (a nologin/service account, which `su -` itself refuses before
+		# this script's own commands ever run) as it can mean an
+		# unexpected symlink under ~/.config. Naming only the symlink
+		# cause, as this message used to, sends whoever reads it looking
+		# for a symlink on an account that was never going to succeed for
+		# an entirely different, more mundane reason.
+		echo -e "\033[1;31mERROR: Could not stage the display configuration for $username. Refusing to continue: this can happen if $username has no interactive login shell (e.g. a nologin/service account), if ~/.config/xfce4 (or a path inside it) is a symlink, or if that account's home directory is otherwise not writable by $username.\033[0m"
+		exit 1
+	fi
+
+	echo -e "\033[1;34m  Registering profile in xfconf...\033[0m"
+
+	pkill -u "$username" xfconfd 2>/dev/null || true
+
+	sleep 1
+
+	if is_user_logged_in "$username"; then
+		echo -e "\033[1;34m  User is logged in, applying directly...\033[0m"
+		local refresh_script
+		refresh_script="$(build_profile_refresh_script "$profile_id" "$profile_name" "$user_uid")"
+		if ! su - "$username" -c "$refresh_script"; then
+			echo -e "\033[1;31mWARNING: xfconf registration failed for $username; the display configuration was staged, but the profile may not show as active until the user logs out and back in.\033[0m"
+		fi
+	else
+		echo -e "\033[1;33m  User not logged in, will apply at next login\033[0m"
+	fi
+
+	echo -e "\033[1;32mProfile refresh complete for $username\033[0m"
+	echo -e "\033[1;33mThe user should log out and back in to see the profile in Display settings.\033[0m"
+}
+
+# Show help
+function show_help() {
+	echo "
+XDPA - XFCE Display Profile Applicator v2.1
+
+USAGE: xdpa [OPTION]
+
+OPTIONS:
+  -l, --list              List your XFCE display profiles
+  -e, --export ID [NAME]  Export profile to system storage (requires sudo)
+  -a, --apply [ID]        Apply system profile to all users (requires sudo)
+  -L, --list-system       List system profiles
+  -v, --verify            Verify profile status
+  -r, --refresh-user USER Refresh profile for specific user (requires sudo)
+  -h, --help              Show this help
+
+WORKFLOW:
+  1. Configure your display settings as desired
+  2. Find the profile ID:     xdpa --list
+  3. Export it system-wide:   sudo xdpa --export <ID> <name>
+  4. Apply to all users:      sudo xdpa --apply
+  5. Verify status:           sudo xdpa --verify
+
+  If a user doesn't see the profile:
+  6. Refresh that user:       sudo xdpa --refresh-user <username>
+
+The profile will be applied to ALL regular users on the system.
+Users need to log out and back in to see the changes.
+"
+}
+
+# UID range for a "regular user" this tool manages. The lower bound tracks
+# /etc/login.defs so a system where an admin raised UID_MIN isn't
+# misclassified; the upper bound is a named constant rather than a bare
+# literal because raising or dropping it is a product-shape decision for
+# whoever operates this tool, not something to infer from a system default.
+REGULAR_UID_MIN="$(read_uid_min_from_login_defs)"
+readonly REGULAR_UID_MIN
+readonly REGULAR_UID_MAX=60000
+
+# Main
+case "${1:-}" in
+	-l|--list)
+		list_user_profiles
+		;;
+	-e|--export)
+		require_root "$@"
+		shift
+		export_profile "${1:-}" "${2:-}"
+		;;
+	-a|--apply)
+		require_root "$@"
+		shift
+		apply_system_profile "${1:-}"
+		;;
+	-L|--list-system)
+		list_system_profiles
+		;;
+	-v|--verify)
+		verify_status
+		;;
+	-r|--refresh-user)
+		require_root "$@"
+		shift
+		refresh_user "${1:-}"
+		;;
+	-h|--help)
+		show_help
+		;;
+	*)
+		show_help
+		exit 1
+		;;
+esac
