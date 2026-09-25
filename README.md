@@ -7,9 +7,10 @@ accounts created after the profile was set up.
 ## The problem it solves
 
 On Rocky Linux 8.10, a two monitor extended desktop configured in XFCE can revert to mirroring the
-same image on both screens after the machine wakes from sleep. XFCE also keeps display profiles
-per user, so a layout one person configures does not carry over to other accounts on the same
-machine.
+same image on both screens after the machine wakes from sleep. The issue was originally observed on
+a dual-monitor desktop with an NVIDIA RTX A2000 GPU driving two Dell P2715Q monitors. XFCE also
+keeps display profiles per user, so a layout one person configures does not carry over to other
+accounts on the same machine.
 
 XDPA works around both problems. An administrator configures the layout once, exports it as a
 profile, and XDPA copies that profile's configuration into every regular user account and
